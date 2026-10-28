@@ -74,6 +74,20 @@ def elfhash(s):
     >>> elfhash(s)
     224648685
     """
+    if type(s) is bytes:
+        size = len(s)
+        if size == 7 and s[0] <= 239:
+            # This bound keeps the first six bytes below the folding threshold.
+            a, b, c, d, e, f, g = s
+            hash = ((a * 256 + b * 16 + c) * 256 + d * 16 + e) * 256 + f * 16 + g
+            return (hash ^ ((hash & 0xF0000000) >> 24)) & 0x0FFFFFFF
+        if size <= 6:
+            a, b, c, d, e, f = s.rjust(6, b'\0')
+            hash = ((a * 16 + b) * 256 + c * 16 + d) * 256 + e * 16 + f
+            # A leading byte at most 239 keeps six bytes below 2**28.
+            if a <= 239:
+                return hash
+            return (hash ^ ((hash & 0xF0000000) >> 24)) & 0x0FFFFFFF
     hash = 0
     x = 0
     for c in s:
