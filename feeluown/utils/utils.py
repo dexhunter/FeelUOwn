@@ -110,9 +110,28 @@ class DedupList(list):
     def __init__(self, seq=(), dedup=True):
         if dedup:
             seq = self.dic().fromkeys(seq)
-        # keep idx in a dict for dedup and index
-        self._map = dict(zip(seq, range(len(seq))))
+        # Each cell records its index and the front removals already applied.
+        self._front_pops = 0
+        self._defer_front = True
+        self._map = {obj: [idx, 0] for obj, idx in zip(seq, range(len(seq)))}
         super().__init__(seq)
+
+    def _cell_index(self, cell):
+        shift = self._front_pops - cell[1]
+        if shift and cell[0] > 0:
+            cell[0] = max(0, cell[0] - shift)
+        cell[1] = self._front_pops
+        return cell[0]
+
+    def _flush_indices(self):
+        front_pops = self._front_pops
+        if front_pops:
+            for cell in self._map.values():
+                shift = front_pops - cell[1]
+                if shift and cell[0] > 0:
+                    cell[0] = max(0, cell[0] - shift)
+                cell[1] = 0
+            self._front_pops = 0
 
     def __getitem__(self, item):
         result = super().__getitem__(item)
@@ -145,7 +164,10 @@ class DedupList(list):
         if value in self._map:
             raise ValueError("item already exists in DedupList")
         self._map.pop(self[key])
-        self._map[value] = key
+        if type(key) is not int:
+            self._flush_indices()
+            self._defer_front = False
+        self._map[value] = [key, self._front_pops]
         super().__setitem__(key, value)
 
     def __contains__(self, item):
@@ -164,31 +186,44 @@ class DedupList(list):
     def swap(self, idx_1, idx_2):
         item_1 = self[idx_1]
         item_2 = self[idx_2]
-        self._map[item_1] = idx_2
-        self._map[item_2] = idx_1
+        if type(idx_1) is not int or type(idx_2) is not int:
+            self._flush_indices()
+            self._defer_front = False
+        self._map[item_1] = [idx_2, self._front_pops]
+        self._map[item_2] = [idx_1, self._front_pops]
         super().__setitem__(idx_1, item_2)
         super().__setitem__(idx_2, item_1)
 
     def sort(self, *args, **kwargs):
         super().sort(*args, **kwargs)
-        self._map = dict(zip(self, range(len(self))))
+        self._map = {obj: [idx, 0] for obj, idx in zip(self, range(len(self)))}
+        self._front_pops = 0
+        self._defer_front = True
 
     def append(self, obj):
-        if obj not in self._map:
-            self._map[obj] = len(self)
-            super().append(obj)
+        # Subclasses can override __len__; preserve its evaluation order.
+        if type(self) is not DedupList:
+            if obj not in self._map:
+                self._map[obj] = [len(self), self._front_pops]
+                super().append(obj)
+            return
+        cell = [len(self), self._front_pops]
+        if self._map.setdefault(obj, cell) is cell:
+            list.append(self, obj)
 
     def extend(self, iterable):
         length = len(self)
         append_list = list(filterfalse(self._map.__contains__, iterable))  # dedup
-        self._map.update(zip(append_list, range(length, length + len(append_list))))
+        self._map.update((obj, [idx, self._front_pops])
+                         for idx, obj in enumerate(append_list, length))
         super().extend(append_list)
 
     def index(self, object, start: int = None, stop: int = None):
-        if object not in self._map:
+        cell = self._map.get(object)
+        if cell is None:
             raise ValueError("not in list")
         # get idx from _map directly
-        idx = self._map[object]
+        idx = self._cell_index(cell)
         if start:
             if not stop:
                 stop = len(self)
@@ -200,34 +235,61 @@ class DedupList(list):
         if obj not in self._map:
             # insert accepts out-of-range indices, but we don't want them in our _map
             index = self._get_index(index)
+            self._flush_indices()
             # all idx in _map after 'index' should be changed
-            for key, idx in self._map.items():
-                if idx >= index:
-                    self._map[key] = idx + 1
-            self._map[obj] = index
+            for cell in self._map.values():
+                if cell[0] >= index:
+                    cell[0] = cell[0] + 1
+            if type(index) is not int:
+                self._defer_front = False
+            self._map[obj] = [index, 0]
             super().insert(index, obj)
 
     def pop(self, index: int = None):
         index = index if index is not None else -1
         item = super().pop(index)
         # list.pop() returns an index, so no need to calculate manually like 'insert'
-        index = self._map.pop(item)
-        # all idx in _map after 'index' should be changed
-        for obj, idx in self._map.items():
-            if idx > index:
-                self._map[obj] = idx - 1
+        cell = self._map.pop(item)
+        front_pops = self._front_pops
+        index = cell[0]
+        if self._defer_front and 0 <= index <= front_pops - cell[1]:
+            self._front_pops = front_pops + 1
+            return item
+        if front_pops and self._defer_front:
+            index = self._cell_index(cell)
+            # Normalize deferred shifts and apply this removal in one pass.
+            for cell in self._map.values():
+                position = cell[0]
+                shift = front_pops - cell[1]
+                if shift and position > 0:
+                    position = max(0, position - shift)
+                if position > index:
+                    position -= 1
+                cell[0] = position
+                cell[1] = 0
+            self._front_pops = 0
+        else:
+            index = self._cell_index(cell)
+            self._flush_indices()
+            # all idx in _map after 'index' should be changed
+            for cell in self._map.values():
+                if cell[0] > index:
+                    cell[0] = cell[0] - 1
         return item
 
     def remove(self, item):
-        if item not in self._map:
+        cell = self._map.get(item)
+        if cell is None:
             # raise same exception as list
             raise ValueError("list.remove(x): x not in list")
-        idx = self._map[item]
+        idx = self._cell_index(cell)
         self.pop(idx)
 
     def clear(self):
         self._map.clear()
         super().clear()
+        self._front_pops = 0
+        self._defer_front = True
 
 
 def int_to_human_readable(i: int) -> str:
